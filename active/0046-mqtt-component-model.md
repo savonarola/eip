@@ -91,12 +91,12 @@ The paper calls a runtime component instance a *fiber*. It separates orchestrati
 
 | State | Meaning in the MQTT model |
 |---|---|
-| Inactive | The component has declarations but cannot send or accept new application requests. It waits for readiness, dependencies, or administrative enablement. |
-| Starting | The coordinator has selected providers and is preparing the activation. The component's resources cannot satisfy other components' dependencies yet. |
+| Inactive | The component has declarations but cannot send or accept new application requests. It waits for dependencies or administrative enablement. |
+| Starting | The component initializes itself through managed requests to its selected providers and writes to its own resources. Its resources cannot satisfy other components' dependencies yet. |
 | Active | The component may send and accept declared application requests. Its installed resources may satisfy dependencies. |
 | Stopping | The plugin rejects new application requests from this activation. The component keeps its selected providers for cleanup. Its resources cannot satisfy new dependencies. |
 
-These states describe a component after the plugin accepts its first SUBSCRIBE packet. Readiness and administrative enablement are separate conditions. A ready component can remain Inactive when a dependency is missing.
+These states describe a component after the plugin accepts its first SUBSCRIBE packet. Administrative enablement permits initialization once dependencies resolve. Readiness reports that initialization has completed during Starting.
 
 The coordinator records two selections of providers. The **target view** selects a currently available provider activation for each dependency. No target exists when a required provider is missing or the component must not run. The **committed view** records the selection made when Starting begins. It remains fixed through cleanup. A change of provider requires a new activation, even when topic names and payloads stay the same.
 
@@ -116,13 +116,13 @@ Disconnect removes the live component immediately. The coordinator retains any u
 
 ### L-transitions: activation and cleanup
 
-L-transitions follow from the component's state and provider selection. The coordinator applies them when their conditions hold. A client's `ready` message reports preparation; it does not directly set the state to Active.
+L-transitions follow from the component's state and provider selection. The coordinator applies them when their conditions hold. A client's `ready` request reports completed initialization. The coordinator checks it before entering Active.
 
 ```mermaid
 stateDiagram-v2
     Inactive --> Starting: L-Begin
     Starting --> Starting: L-Iter
-    Starting --> Active: L-Finish
+    Starting --> Active: L-Finish (ready)
     Starting --> Stopping: L-Divert
     Active --> Stopping: L-Leave
     Stopping --> Inactive: L-Unload
@@ -130,16 +130,16 @@ stateDiagram-v2
 
 | Rule | Condition and action in the MQTT model |
 |---|---|
-| `L-Begin` | When a connected Inactive component is ready, enabled, not retiring, and has all required providers, assign a new activation ID and commit those providers. Enter Starting. |
-| `L-Iter` | While the selected providers still match the target, complete an activation setup action and record its cleanup action. Remain Starting while setup continues. |
-| `L-Finish` | When setup is complete and the selected providers still match the target, enter Active. Make installed resources available and send `activated`. |
-| `L-Divert` | When the target changes during Starting, stop setup and enter Stopping. Include completed setup actions in cleanup. |
+| `L-Begin` | When a connected Inactive component is enabled, not retiring, and has all required providers, create an internal activation ID and commit those providers. Enter Starting and send `initialize`. |
+| `L-Iter` | While the selected providers still match the target, process a managed initialization operation with its recorded cleanup action. Remain Starting. |
+| `L-Finish` | When the component sends `ready`, check that initialization has completed and the selected providers still match the target. Enter Active, make installed resources available, and respond `activated` to the request. |
+| `L-Divert` | When the target changes during Starting, stop initialization, enter Stopping, and send `deactivated`. Include accepted initialization operations in cleanup. |
 | `L-Leave` | When an Active component loses its target or its selected providers change, enter Stopping and send `deactivated`. |
 | `L-Unload` | After committed dependents finish cleanup, reverse this activation's recorded actions. Release its provider bindings and return to Inactive when cleanup completes. |
 
-Initial declaration subscriptions and handler preparation may precede Starting. They do not make resources available to dependents. During Active, accepted application requests add cleanup records without changing the lifecycle state.
+The plugin creates declaration subscriptions before Starting. Managed initialization operations begin only after `L-Begin`. During Active, accepted application requests continue to add cleanup records without changing the lifecycle state.
 
-Entering Stopping withdraws resources from new use before cleanup removes them. A connected provider keeps the subscriptions needed by existing dependents until their cleanup completes. If setup completes after `L-Divert`, the plugin must include that work in cleanup. It must not activate the component using the old provider selection.
+Entering Stopping withdraws resources from new use before cleanup removes them. A connected provider keeps the subscriptions needed by existing dependents until their cleanup completes. If an initialization operation completes after `L-Divert`, the plugin must include that work in cleanup. It must not activate the component using the old provider selection.
 
 Each coordinator metadata update is atomic. Setup, MQTT delivery, and cleanup can take several updates. The coordinator must not treat sending a cleanup request as confirmation that cleanup completed.
 
@@ -147,7 +147,7 @@ Each coordinator metadata update is atomic. Setup, MQTT delivery, and cleanup ca
 
 In this example, the switch and lamp are devices, each represented by a connected MQTT client. The switch depends on resources provided by the lamp.
 
-When a switch submits its declaration packet, `O-Insert` records it as Inactive. If its lamp provider is unavailable, the switch waits. When the lamp becomes available and the switch is ready, `L-Begin` starts an activation. `L-Finish` makes it Active after setup.
+When a switch submits its declaration packet, `O-Insert` records it as Inactive. If its lamp provider is unavailable, the switch waits. When the lamp becomes available, `L-Begin` starts an activation. The switch initializes through managed requests and sends `ready`. The coordinator performs `L-Finish` and responds `activated` to confirm that the switch is Active.
 
 If the lamp leaves, the switch takes `L-Leave` and then `L-Unload`. The switch remains connected and can activate again when a provider becomes available. No new `O-Insert` is needed. If the switch itself leaves, `O-Retire` prevents reactivation. `O-Remove` follows completed cleanup.
 
@@ -161,7 +161,7 @@ If the lamp leaves, the switch takes `L-Leave` and then `L-Unload`. The switch r
 | Component ID | Stable component type or logical name |
 | Instance ID | Stable identity of one deployed component instance |
 | Activation | One run with fixed provider bindings, including setup and cleanup |
-| Activation ID | Unique identity assigned at `L-Begin` and retained through cleanup |
+| Activation ID | Internal identifier assigned at `L-Begin` and retained through cleanup |
 | Resource key | A declared `$state`, `$service`, or `$reg` topic contract |
 | Provider | The component that declares and installs a resource key |
 | Dependent | A component that declares a requirement on a resource key |
@@ -173,9 +173,9 @@ A component exists for one MQTT connection. Disconnecting removes the component 
 
 The coordinator associates connection events with the component on that connection. An event from a disconnected component must not affect a new component. Cleanup records may remain after disconnect until cleanup finishes.
 
-A component may stay connected through Inactive, Starting, Active, and Stopping. Each `L-Begin` creates a new activation ID. The activation ID prevents delayed requests or cleanup from affecting a later activation.
+A component may stay connected through Inactive, Starting, Active, and Stopping. The coordinator assigns a new activation ID at each `L-Begin`. It uses that ID to track provider bindings, managed requests, and cleanup records. Internal completion events retain the ID of the activation that issued the work.
 
-The plugin assigns activation IDs. It may expose them as reserved MQTT User Properties. Clients must not assign or replace these IDs.
+Clients do not need to send or interpret activation IDs. The plugin associates incoming requests with the current activation on the MQTT connection. Lifecycle messages are `initialize`, `ready`, `deactivated`, and `cleanup_complete`. The response to `ready` confirms activation.
 
 ### Plugin state coordinator
 
@@ -184,7 +184,7 @@ The plugin state coordinator stores and updates all component metadata for one t
 The coordinator maintains:
 
 - Component declarations, instance IDs, and MQTT connections.
-- Component readiness, enabled status, and current activations.
+- Component readiness, enabled status, and internal activation IDs.
 - Resource declarations, installation status, availability, and dependencies.
 - Available provider activations and the provider activations selected for each dependent.
 - Registry membership and ownership of retained values and registry entries.
@@ -268,7 +268,7 @@ The plugin exposes an installed provision as available only when the component i
 | `$service/X` | Subscribe to apply and retract operations | Publish an opaque command | Non-retained |
 | `$reg/X` | Subscribe to registry entries | Register, observe, or both | Plugin-managed retained entries |
 
-System lifecycle topics are separate from these resources. The client may include system-topic subscriptions in its first SUBSCRIBE packet. These subscriptions do not declare application resources. Publishing readiness or receiving an activation notification neither provides nor requires an application resource.
+System lifecycle topics are separate from these resources. The client may include system-topic subscriptions in its first SUBSCRIBE packet. These subscriptions do not declare application resources. Sending `ready` or receiving its response neither provides nor requires an application resource.
 
 The declaration filters create the subscriptions used by these operations. A successful subscription does not make the component active. The activation rules still apply.
 
@@ -330,7 +330,7 @@ Dependent C:
 
 The plugin processes the base publication as follows:
 
-1. Check that C is Active and has a committed binding to `$service/X`.
+1. Check that C is Starting or Active and has a committed binding to `$service/X`.
 2. Allocate a fresh effect ID.
 3. Record the effect ID, owner activation, and provider activation.
 4. Suppress the base publication.
@@ -340,9 +340,6 @@ The plugin processes the base publication as follows:
 Topic: $service/X/apply/<effect-id>
 Payload: <original opaque command>
 RETAIN: 0
-User Properties:
-    component-activation = <dependent activation>
-    provider-activation = <committed provider activation>
 ```
 
 The plugin must record the effect before forwarding it. Otherwise, a failure could leave an applied operation with no record from which to issue cleanup.
@@ -357,9 +354,6 @@ When the dependent explicitly releases the effect or the plugin cleans up its ac
 Topic: $service/X/retract/<effect-id>
 Payload: <empty>
 RETAIN: 0
-User Properties:
-    component-activation = <original dependent activation>
-    provider-activation = <committed provider activation>
 ```
 
 The empty payload is sufficient because the provider retains enough information to retract the effect by ID. The provider defines what retraction means for the application operation.
@@ -446,9 +440,6 @@ The plugin validates the committed binding, suppresses the base publication, and
 Topic: $reg/X/<dependent-instance>
 Payload: <original opaque record>
 RETAIN: 1
-User Properties:
-    component-activation = <dependent activation>
-    registry-activation = <committed registry-provider activation>
 ```
 
 Only the plugin may publish or delete generated registry entries. A dependent cannot select another component's suffix. When replicas are possible, the suffix identifies the component instance rather than only its component type.
@@ -491,7 +482,7 @@ The declaration filters above do not encode membership conditions. Their encodin
 
 The plugin maintains two views for each activation:
 
-- The target view selects an available provider activation for each dependency. No target exists when the component is not ready, is disabled or retiring, or lacks a required provider.
+- The target view selects an available provider activation for each dependency. No target exists when the component is disabled or retiring, or lacks a required provider.
 - The committed view contains the provider activations selected at `L-Begin`. It remains fixed until cleanup completes.
 
 A component activates only when each hard requirement resolves according to its contract. The committed view records provider activation identities, not only logical topic names or payloads.
@@ -500,35 +491,74 @@ Provider replacement changes the binding even if the new provider uses the same 
 
 The hard dependency graph must be acyclic. The `$consume/...` filters above declare hard dependencies. The encoding of soft or advisory dependencies remains to be defined.
 
+### Component self-initialization
+
+The component initializes itself during Starting. At `L-Begin`, the coordinator commits the selected providers. The plugin sends an `initialize` notification on a system topic. The component may then issue managed initialization operations.
+
+Each initialization operation is an `L-Iter` step. It uses the same declarations, provider bindings, and cleanup rules as an operation during Active:
+
+| Initialization operation | Required declaration | Recorded cleanup |
+|---|---|---|
+| Send a request to `$service/X` | `$consume/service/X` | Retract the accepted request through the selected service provider |
+| Publish a retained value to `$state/X` | `$provide/state/X` | Restore the preceding retained message or delete the new value |
+| Publish a registration to `$reg/X` | `$consume/reg/X` | Delete the entry owned by this activation |
+
+The coordinator records each operation's owner and cleanup action before the plugin forwards the request or changes retained data. These records belong to the activation that began at `L-Begin`. Cleanup runs in reverse order when the actions do not commute. Initialization can change retained values and registry entries before the component becomes Active. Those changes do not make its provided resources available to dependents.
+
+For a registration, the dependency is on another component's registry. The new entry belongs to the initializing component's activation. Creating that entry does not make the component a provider of the registry.
+
+#### Completing initialization
+
+After initialization completes, the component publishes a non-retained `ready` request to the system topic for readiness. It tells the coordinator that the component has finished its initialization operations and prepared its declared handlers and retained values. The component waits for the response to this request.
+
+The component must wait for the initialization results it needs before sending `ready`. For service requests, use the application-level acknowledgements required by the service contract. An MQTT acknowledgement alone does not confirm that the provider completed a request.
+
+The coordinator checks that the connected component is still Starting. It also checks that initialization operations have completed, declared resources are installed, and the selected providers still match the target. It then performs `L-Finish` and responds `activated` to the `ready` request. The component's installed resources can now satisfy dependencies. If a check fails, the plugin returns an error response with the reason. A rejected request does not perform `L-Finish`.
+
+The `activated` response confirms activation at the application level. It is the successful response to `ready`, not a separate notification. It is separate from the MQTT acknowledgement of the request publication.
+
+The plugin retains initialization cleanup records throughout Active. It uses them when the activation later stops. Each new activation runs initialization again and sends its own `ready` request.
+
+#### Interrupted initialization
+
+When a dependency disappears or changes during initialization, the coordinator takes `L-Divert`. The plugin sends a `deactivated` notification on the component's system topic. This notification tells the component that initialization has stopped, even though it never reached Active.
+
+On receiving `deactivated`, the component must stop initialization and cancel pending local work. It must not send further initialization operations or `ready`. It performs its local cleanup and reports `cleanup_complete`.
+
+The coordinator rejects further initialization operations as soon as it enters Stopping. It does not wait for the component to receive the notification. Cleanup includes accepted service requests, retained writes, and registry entries. It preserves the per-request apply-before-retract order.
+
+The coordinator rejects `ready` unless the component is Starting. A late operation result still belongs to the activation that issued it. Disconnect removes the component, but the plugin keeps the records needed to clean up its initialization.
+
 ### Readiness and lifecycle
 
 Each component maintains a system-topic subscription for lifecycle notifications. System topic names are separate from application resources and remain available while the component is inactive.
 
-The control exchange is:
+The control messages use system topics:
 
 ```text
-Component -> plugin: ready
-Plugin -> component: activated
+Plugin -> component: initialize
+Component -> plugin: ready (request)
+Plugin -> component: activated (response to ready)
 Plugin -> component: deactivated
 Component -> plugin: cleanup_complete
 ```
 
-`ready` means that the component has installed and prepared its declared provisions. It does not claim that its requirements are satisfied.
+`initialize` permits the component to begin managed initialization using its committed providers. `ready` reports that initialization has completed. The coordinator checks dependency availability itself.
 
-The activation condition is:
+The conditions for `L-Begin` are:
 
 ```text
-component is ready
+component is connected and Inactive
 and all hard requirements are available
 and the component is administratively enabled
 and the component is not retiring
 ```
 
-These conditions permit `L-Begin`. The plugin sends `activated` only after `L-Finish`.
+The component does not send `ready` before `L-Begin`. The plugin responds `activated` to `ready` only after completing `L-Finish`.
 
 `deactivated` means that the component must stop accepting or initiating new application requests. Cleanup requests remain allowed. It does not mean that cleanup has completed.
 
-Lifecycle messages identify the activation and carry monotonic generations. A delayed readiness or cleanup message cannot affect a newer activation.
+The coordinator associates lifecycle messages with the MQTT connection and the component's current state. Before sending `cleanup_complete`, the component must finish or cancel its previous initialization and stop sending requests from that work. The coordinator waits for cleanup to complete before sending another `initialize`.
 
 ### Withdrawal and cleanup ordering
 
@@ -581,16 +611,17 @@ The lifecycle supplies ordering between a provider's installation and its depend
 | Publish `$reg/X` | `$consume/reg/X` through a committed binding |
 | Subscribe `$reg/X/#` as observer | `$consume/reg/X/#` |
 | Publish generated `$reg/X/...` entries | Plugin only |
-| Write reserved activation User Properties | Plugin only |
 
 The plugin checks authorization against the connected component, current activation, declarations, and committed provider binding.
+
+Starting components may issue the managed initialization operations described above. Active components may continue to use those operations. Inactive components must not issue them. Stopping components may perform only cleanup operations.
 
 ### Core invariants
 
 The model depends on these invariants:
 
 1. At most one activation is current for an instance.
-2. Only a connected Active component may advertise resources or send new application requests.
+2. A connected Starting component may issue managed initialization operations. Only a connected Active component may make its resources available to dependents.
 3. A component accesses only resources and operations allowed by its first SUBSCRIBE packet.
 4. A declared provision is not selectable until it is installed and its provider is active.
 5. Every dependent activation binds to concrete provider activations.
@@ -616,7 +647,7 @@ The plugin can strongly govern broker-owned state and admission:
 
 The plugin cannot erase an MQTT message already delivered or a physical consequence already produced. A service retraction establishes the recovery behavior promised by that service. It does not make physical history equivalent to a history in which the operation never occurred.
 
-MQTT delivery also introduces duplicates, loss according to QoS, and interleaving among different effects. Effect IDs, request identities, idempotence, per-effect channel ordering, activation generations, and application-level acknowledgements address these conditions. A reconnect creates a new component. Pending events and cleanup from the disconnected component must not affect it. MQTT Wills provide failure signals; they do not execute cleanup.
+MQTT delivery also introduces duplicates, loss according to QoS, and interleaving among different effects. Effect IDs, request identities, idempotence, per-effect channel ordering, and application-level acknowledgements address these conditions. A reconnect creates a new component. Pending events and cleanup from the disconnected component must not affect it. MQTT Wills provide failure signals; they do not execute cleanup.
 
 The strongest framework guarantee is:
 
