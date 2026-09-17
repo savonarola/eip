@@ -48,7 +48,7 @@ Topics provide stable, language-neutral names. Publications separate an operatio
 
 This is a good boundary for effects visible through MQTT. It covers resource admission, broker-retained state, registrations, and operations implemented by cooperating providers. It does not cover unreported local state, out-of-band communication, or the physical world. A component receives the framework's guarantees only for interactions that pass through the managed namespaces and obey their contracts.
 
-MQTT components appear, disappear, reconnect, and change dependencies at runtime. A useful component framework must answer two questions:
+MQTT components appear, disappear, and change dependencies at runtime. A useful component framework must answer two questions:
 
 1. Which components may run with the resources currently available?
 2. Which effects must be removed when a component can no longer run?
@@ -73,7 +73,7 @@ retract(A); apply(B)     ~= apply(B); retract(A)
 retract(A); retract(B)   ~= retract(B); retract(A)
 ```
 
-The service then reaches an equivalent state regardless of how MQTT deliveries from different components are interleaved. The plugin does not need to establish a total order between independent components.
+The service then reaches an equivalent state regardless of how MQTT deliveries from different components are interleaved. The plugin processes metadata changes serially. Independent components may process application requests concurrently.
 
 The model still imposes a causal order within one effect. The plugin sends `apply(E)` before `retract(E)` and never sends another `apply(E)` afterward. Commutativity governs interleavings between distinct effect IDs, not the two operations of one effect.
 
@@ -87,11 +87,10 @@ Publishing itself does not make an operation commutative. The service provider d
 
 | Term | Meaning |
 |---|---|
-| Component | A customer MQTT client participating in the framework |
+| Component | A connected customer MQTT client participating in the framework |
 | Component ID | Stable component type or logical name |
 | Instance ID | Stable identity of one deployed component instance |
-| Connection epoch | Identity of one MQTT connection incarnation |
-| Activation | One period during which an instance may perform business operations |
+| Activation | One period during which a component may process application requests |
 | Activation ID | Unique identity of that activation period |
 | Resource key | A declared `$state`, `$service`, or `$reg` topic contract |
 | Provider | The component that declares and installs a resource key |
@@ -100,11 +99,32 @@ Publishing itself does not make an operation commutative. The service provider d
 | Requirement | Requested access to a resource declared in `requires` |
 | Effect ID | Plugin-assigned identity of one managed service operation |
 
-An activation is not an MQTT connection. A component may stay connected while waiting for dependencies, running, draining, and waiting to run again. Each return to active service creates a new activation ID.
+A component exists for one MQTT connection. Disconnecting removes the component and ends its activation. Reconnecting creates a new component, even when the client reuses the same component and instance IDs. These IDs name the component type and deployed instance. They do not preserve the component across connections.
 
-The connection epoch prevents a delayed Will or stale connection event from affecting a replacement connection. The activation ID prevents delayed business operations or cleanup from affecting a later activation on the same connection.
+The coordinator associates connection events with the component on that connection. An event from a disconnected component must not affect a new component. Cleanup records may remain after disconnect until cleanup finishes.
 
-The plugin owns these identities. It may expose them as reserved MQTT User Properties, but clients cannot assert or replace their canonical values.
+A component may stay connected while waiting for dependencies, running, draining, and waiting to run again. Each return to active service creates a new activation ID. The activation ID prevents delayed requests or cleanup from affecting a later activation.
+
+The plugin assigns activation IDs. It may expose them as reserved MQTT User Properties. Clients must not assign or replace these IDs.
+
+### Plugin state coordinator
+
+The plugin state coordinator stores and updates all component metadata for one tenant. The MQTT connection determines which coordinator handles an operation. The coordinator looks up components and their dependencies only within that tenant. Manifests and metadata records must not include tenant fields. Resource keys and topics must not include tenant prefixes.
+
+The coordinator maintains:
+
+- Component manifests, instance IDs, and MQTT connections.
+- Component readiness, enabled status, and current activations.
+- Resource declarations, installation status, availability, and dependencies.
+- Available provider activations and the provider activations selected for each dependent.
+- Registry membership and ownership of retained values and registry entries.
+- Accepted service requests, request identities, cleanup actions, and cleanup progress.
+
+MQTT connection handlers and plugin hooks send operations and events to the coordinator. The coordinator processes them one at a time. It checks each operation against the current metadata before updating it. The check and update are atomic, including updates that affect several components. Other operations see either the complete update or no change. A rejected operation leaves the metadata unchanged.
+
+For example, the coordinator checks a service request against the connected component's current activation, manifest, and selected provider activation. It records the accepted request as part of the same atomic update. When the provider becomes unavailable, the coordinator marks its resources and affected dependents' resources as unavailable in one update. It also disables new application requests from affected activations in that update. Cleanup requests remain allowed. Cleanup includes service requests accepted before the update.
+
+The coordinator records pending actions before the plugin forwards messages, changes retained messages, or runs cleanup. It handles completion and failure reports as later metadata updates. The atomicity guarantee applies to metadata updates. Message delivery and request execution follow the ordering and acknowledgement rules below.
 
 ### Declarations and confinement
 
@@ -447,7 +467,7 @@ where the arrow means "depends on," loss of the lamp produces this sequence:
 
 The ordering concerns cleanup completion, not only notification order. A provider keeps its service and registry subscriptions available to committed dependents while they retract service effects and remove registry entries.
 
-If a provider crashes, the plugin cannot preserve it for cleanup. The plugin still withdraws it, rejects further operations from affected activations, reverses broker-owned effects, and records client-side cleanup as failed or unknown where necessary.
+If a provider disconnects before cleanup finishes, the plugin cannot preserve it for cleanup. The plugin still withdraws it, rejects further operations from affected activations, reverses broker-owned effects, and records client-side cleanup as failed or unknown where necessary.
 
 ### Effect classes
 
@@ -478,14 +498,14 @@ The lifecycle supplies ordering between a provider's installation and its depend
 | Publish generated `$reg/X/...` entries | Plugin only |
 | Write reserved activation User Properties | Plugin only |
 
-Authorization is checked against the authenticated instance, current activation, manifest, and committed provider binding.
+The plugin checks authorization against the connected component, current activation, manifest, and committed provider binding.
 
 ### Core invariants
 
 The model depends on these invariants:
 
 1. At most one activation is current for an instance.
-2. A stale connection epoch or activation cannot advertise resources or perform operations.
+2. Only a connected component's current activation may advertise resources or send new application requests.
 3. A component accesses only resources and modes declared in its manifest.
 4. A declared provision is not selectable until it is installed and its provider is active.
 5. Every dependent activation binds to concrete provider activations.
@@ -497,6 +517,7 @@ The model depends on these invariants:
 11. Every generated registry entry has one owning dependent activation.
 12. Cleanup from an old activation cannot remove state belonging to a replacement activation.
 13. Service commutativity and retraction laws are explicit provider obligations.
+14. The coordinator checks and updates component metadata atomically, one operation at a time.
 
 ### Guarantee boundary
 
@@ -510,7 +531,7 @@ The plugin can strongly govern broker-owned state and admission:
 
 The plugin cannot erase an MQTT message already delivered or a physical consequence already produced. A service retraction establishes the recovery behavior promised by that service. It does not make physical history equivalent to a history in which the operation never occurred.
 
-MQTT delivery also introduces duplicates, loss according to QoS, reconnect races, and interleaving among different effects. Effect IDs, request identities, idempotence, per-effect channel ordering, connection epochs, activation generations, and application-level acknowledgements address these conditions. MQTT Wills provide failure signals; they do not execute cleanup.
+MQTT delivery also introduces duplicates, loss according to QoS, and interleaving among different effects. Effect IDs, request identities, idempotence, per-effect channel ordering, activation generations, and application-level acknowledgements address these conditions. A reconnect creates a new component. Pending events and cleanup from the disconnected component must not affect it. MQTT Wills provide failure signals; they do not execute cleanup.
 
 The strongest framework guarantee is:
 
