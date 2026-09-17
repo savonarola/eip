@@ -95,8 +95,8 @@ Publishing itself does not make an operation commutative. The service provider d
 | Resource key | A declared `$state`, `$service`, or `$reg` topic contract |
 | Provider | The component that declares and installs a resource key |
 | Dependent | A component that declares a requirement on a resource key |
-| Provision | Authority to install a resource declared in `provides` |
-| Requirement | Requested access to a resource declared in `requires` |
+| Provision | Authority to install a resource declared with `$provide/...` |
+| Requirement | A dependency declared with `$consume/...` |
 | Effect ID | Plugin-assigned identity of one managed service operation |
 
 A component exists for one MQTT connection. Disconnecting removes the component and ends its activation. Reconnecting creates a new component, even when the client reuses the same component and instance IDs. These IDs name the component type and deployed instance. They do not preserve the component across connections.
@@ -109,11 +109,11 @@ The plugin assigns activation IDs. It may expose them as reserved MQTT User Prop
 
 ### Plugin state coordinator
 
-The plugin state coordinator stores and updates all component metadata for one tenant. The MQTT connection determines which coordinator handles an operation. The coordinator looks up components and their dependencies only within that tenant. Manifests and metadata records must not include tenant fields. Resource keys and topics must not include tenant prefixes.
+The plugin state coordinator stores and updates all component metadata for one tenant. The MQTT connection determines which coordinator handles an operation. The coordinator looks up components and their dependencies only within that tenant. Declarations and metadata records must not include tenant fields. Resource keys and topics must not include tenant prefixes.
 
 The coordinator maintains:
 
-- Component manifests, instance IDs, and MQTT connections.
+- Component declarations, instance IDs, and MQTT connections.
 - Component readiness, enabled status, and current activations.
 - Resource declarations, installation status, availability, and dependencies.
 - Available provider activations and the provider activations selected for each dependent.
@@ -122,42 +122,48 @@ The coordinator maintains:
 
 MQTT connection handlers and plugin hooks send operations and events to the coordinator. The coordinator processes them one at a time. It checks each operation against the current metadata before updating it. The check and update are atomic, including updates that affect several components. Other operations see either the complete update or no change. A rejected operation leaves the metadata unchanged.
 
-For example, the coordinator checks a service request against the connected component's current activation, manifest, and selected provider activation. It records the accepted request as part of the same atomic update. When the provider becomes unavailable, the coordinator marks its resources and affected dependents' resources as unavailable in one update. It also disables new application requests from affected activations in that update. Cleanup requests remain allowed. Cleanup includes service requests accepted before the update.
+For example, the coordinator checks a service request against the connected component's current activation, declarations, and selected provider activation. It records the accepted request as part of the same atomic update. When the provider becomes unavailable, the coordinator marks its resources and affected dependents' resources as unavailable in one update. It also disables new application requests from affected activations in that update. Cleanup requests remain allowed. Cleanup includes service requests accepted before the update.
 
 The coordinator records pending actions before the plugin forwards messages, changes retained messages, or runs cleanup. It handles completion and failure reports as later metadata updates. The atomicity guarantee applies to metadata updates. Message delivery and request execution follow the ordering and acknowledgement rules below.
 
 ### Declarations and confinement
 
-Each component has an explicit manifest. This example is illustrative; it does not fix the eventual manifest syntax.
+The first SUBSCRIBE packet sent by a component declares its resources and dependencies. The client includes all declarations as topic filters in that packet. The virtual prefix `$provide/...` declares a resource provider. The virtual prefix `$consume/...` declares a dependency.
 
-```yaml
-component: switch
-instance: switch-1
+For example, a switch sends one packet:
 
-provides:
-  - kind: service
-    key: $service/switch/1
-
-requires:
-  - kind: state
-    key: $state/lamp/1/contract
-    access: read
-
-  - kind: service
-    key: $service/lamp/1/control
-
-  - kind: registry
-    key: $reg/lamp/1/controllers
-    access: [register, observe]
+```text
+SUBSCRIBE
+    $provide/service/switch/1
+    $consume/state/lamp/1/contract
+    $consume/service/lamp/1/control
+    $consume/reg/lamp/1/controllers
+    $consume/reg/lamp/1/controllers/#
 ```
 
-Declarations are not inferred from traffic. An MQTT operation must conform to an existing declaration; performing the operation cannot grant the declaration retroactively.
+The plugin records the declarations and creates subscriptions on the corresponding resource topics. The resource kind determines the subscription filters:
+
+| Declaration filter | Actual subscription | Meaning |
+|---|---|---|
+| `$provide/state/X` | `$state/X` | Provide the retained value at `$state/X` |
+| `$consume/state/X` | `$state/X` | Depend on and read `$state/X` |
+| `$provide/service/X` | `$service/X` | Provide `$service/X` |
+| `$consume/service/X` | `$service/X` | Depend on and send requests to `$service/X` |
+| `$provide/reg/X` | `$reg/X/#` | Provide the registry `$reg/X` |
+| `$consume/reg/X` | `$reg/X` | Depend on and register in `$reg/X` |
+| `$consume/reg/X/#` | `$reg/X/#` | Depend on and observe `$reg/X` |
+
+For `$provide/service/X`, the plugin also creates `$service/X/apply/+` and `$service/X/retract/+` subscriptions for the service protocol below. For `$provide/reg/X`, the plugin adds `/#` to the implicit subscription so the provider receives all registry entries. The declaration names the registry itself.
+
+The virtual prefixes appear only in declaration filters. Clients publish application messages to `$state/...`, `$service/...`, and `$reg/...`. Subscribers receive messages on those resource topics.
+
+The coordinator checks and records the declarations from the first packet together. Later SUBSCRIBE packets and publications must follow those declarations. They must not add resources or dependencies. A reconnect creates a new component with a new first SUBSCRIBE packet.
 
 The confinement rules are:
 
-- A component may install only resources listed in `provides`.
-- A component may access only resources listed in `requires`.
-- A requirement states the permitted access mode.
+- A component may install only resources declared with `$provide/...`.
+- A component may use another component's resource only through a `$consume/...` declaration.
+- The declaration determines the permitted operations on the resource.
 - A component may not use a wildcard to escape its declared topic scope.
 - A client may not publish to plugin-generated internal topics or reserved User Properties.
 - Provider declarations for the same logical resource must not conflict or overlap unless the resource contract explicitly supports it.
@@ -172,15 +178,15 @@ A provision moves through three relevant states:
 
 | State | Meaning |
 |---|---|
-| Declared | The manifest permits the component to provide the key |
-| Installed | The component created the backing subscription, handler, or retained value |
+| Declared | The first SUBSCRIBE packet includes a `$provide/...` filter for the key |
+| Installed | The resource has its required subscriptions, handlers, or retained value |
 | Available | The installed provision belongs to the current active provider activation and may satisfy requirements |
 
 The installation condition depends on the resource kind:
 
 - A `$state` value is installed when its retained message exists.
-- A `$service` is installed when its apply and retract subscriptions and handlers are ready.
-- A `$reg` space is installed when its registry subscription and handler are ready.
+- A `$service` is installed when the plugin has created its apply and retract subscriptions and the provider has prepared its handlers.
+- A `$reg` space is installed when the plugin has created its registry subscription and the provider has prepared its handler.
 
 The plugin exposes an installed provision as available only when the component has reported readiness, its own hard requirements are satisfied, and its activation is current.
 
@@ -192,7 +198,9 @@ The plugin exposes an installed provision as available only when the component h
 | `$service/X` | Subscribe to apply and retract operations | Publish an opaque command | Non-retained |
 | `$reg/X` | Subscribe to registry entries | Register, observe, or both | Plugin-managed retained entries |
 
-System lifecycle topics are separate from these resources. Publishing readiness or receiving an activation notification neither provides nor requires an application resource.
+System lifecycle topics are separate from these resources. The client may include system-topic subscriptions in its first SUBSCRIBE packet. These subscriptions do not declare application resources. Publishing readiness or receiving an activation notification neither provides nor requires an application resource.
+
+The declaration filters create the subscriptions used by these operations. A successful subscription does not make the component active. The activation rules still apply.
 
 ### State resources
 
@@ -200,12 +208,11 @@ A `$state` resource exposes retained data owned by its provider.
 
 ```text
 Provider P:
-    PROVIDES $state/X
+    First SUBSCRIBE: $provide/state/X
     PUBLISH RETAIN $state/X
 
 Dependent C:
-    REQUIRES $state/X with read access
-    SUBSCRIBE $state/X
+    First SUBSCRIBE: $consume/state/X
 ```
 
 Only the provider may write, replace, or delete the retained message. A dependent may subscribe and read, but it may not write the topic merely because it requires the value.
@@ -232,20 +239,20 @@ A retained write is reversible as broker state. It does not erase copies already
 
 A `$service` resource accepts operations from components that depend on its provider. In this model, each accepted command creates one activation-scoped effect.
 
-The provider installs one compound service contract:
+The provider declares the service in its first SUBSCRIBE packet:
 
 ```text
 Provider P:
-    PROVIDES $service/X
-    SUBSCRIBE $service/X/apply/+
-    SUBSCRIBE $service/X/retract/+
+    First SUBSCRIBE: $provide/service/X
 ```
+
+The plugin creates subscriptions to `$service/X`, `$service/X/apply/+`, and `$service/X/retract/+`. The provider prepares handlers for apply and retract requests before reporting readiness.
 
 The dependent publishes an opaque command to the logical base topic:
 
 ```text
 Dependent C:
-    REQUIRES $service/X
+    First SUBSCRIBE: $consume/service/X
     PUBLISH $service/X
 ```
 
@@ -338,18 +345,19 @@ A `$reg` resource is a retained registry space provided by one component and pop
 
 ```text
 Registry provider P:
-    PROVIDES $reg/X
-    SUBSCRIBE $reg/X/#
+    First SUBSCRIBE: $provide/reg/X
 ```
+
+The plugin creates the subscription `$reg/X/#` for the provider.
 
 A dependent may request either or both access modes:
 
-| Access | MQTT operation | Meaning |
+| Declaration filter | Access | Meaning |
 |---|---|---|
-| `register` | Publish `$reg/X` | Maintain this activation's record in the registry |
-| `observe` | Subscribe `$reg/X/#` | Observe the current registry entries |
+| `$consume/reg/X` | `register` | Publish to `$reg/X` to maintain this activation's record |
+| `$consume/reg/X/#` | `observe` | Receive the current registry entries on `$reg/X/#` |
 
-The manifest determines the role. A dependent subscribing as an observer does not become another registry provider. Its subscription is safe because the plugin has already established its dependency on the declared provider.
+Include both filters in the first SUBSCRIBE packet to register and observe. Both filters declare a dependency on the same registry provider. A `$consume/reg/X/#` declaration does not make the dependent a provider.
 
 #### Registration
 
@@ -357,7 +365,7 @@ A dependent registers by publishing an opaque record to the virtual base topic:
 
 ```text
 Dependent C:
-    REQUIRES $reg/X with register access
+    First SUBSCRIBE: $consume/reg/X
     PUBLISH $reg/X
     Payload: <opaque record>
 ```
@@ -403,9 +411,11 @@ This is the paper's table-of-registrations pattern. The registry provider owns t
 
 #### Observation and membership
 
-Any dependent with `observe` access may subscribe to the generated entries. Observation alone creates a dependency on the registry provider, not on every component that owns an entry.
+The plugin subscribes dependents with `$consume/reg/X/#` declarations to the generated entries. Observation alone creates a dependency on the registry provider, not on every component that owns an entry.
 
 A component that requires particular members must declare a membership condition separately. Examples include an exact set of instance IDs, at least `N` entries, or another contract-defined predicate. The plugin records the selected member activations in the component's committed view.
+
+The declaration filters above do not encode membership conditions. Their encoding in the first SUBSCRIBE packet remains to be defined.
 
 ### Dependency resolution
 
@@ -418,7 +428,7 @@ A component activates only when each hard requirement resolves according to its 
 
 Provider replacement changes the binding even if the new provider uses the same topics and publishes identical values. The default response is to deactivate the old consumer activation and create a new activation with fresh bindings.
 
-The hard dependency graph must be acyclic. A component that observes a resource without requiring it for activation may declare a soft or advisory requirement instead.
+The hard dependency graph must be acyclic. The `$consume/...` filters above declare hard dependencies. The encoding of soft or advisory dependencies remains to be defined.
 
 ### Readiness and lifecycle
 
@@ -476,7 +486,7 @@ If a provider disconnects before cleanup finishes, the plugin cannot preserve it
 | Write `$state/X` retained message | Restore or delete the preceding retained message | Plugin |
 | Apply `$service/X` effect | Publish `$service/X/retract/<effect-id>` | Plugin and service provider |
 | Create `$reg/X` entry | Delete the activation-owned retained entry | Plugin |
-| Install service or registry subscription | Remove the subscription after dependent cleanup | Provider component |
+| Create service or registry subscription from a declaration | Remove the subscription after dependent cleanup | Plugin |
 | Perform a physical action | Contract-defined compensation or safe-state action | Device or service provider |
 
 Effects within one activation are reversed in last-in-first-out order when they do not otherwise commute.
@@ -487,18 +497,20 @@ The lifecycle supplies ordering between a provider's installation and its depend
 
 | MQTT operation | Required declaration or authority |
 |---|---|
-| Publish retained `$state/X` | Provide `$state/X` |
-| Subscribe `$state/X` | Require `$state/X` with read access |
-| Subscribe `$service/X/apply/+` and `retract/+` | Provide `$service/X` |
-| Publish `$service/X` | Require `$service/X` through a committed binding |
+| Publish retained `$state/X` | `$provide/state/X` |
+| Subscribe `$state/X` | `$provide/state/X` or `$consume/state/X` |
+| Subscribe `$service/X` | `$provide/service/X` or `$consume/service/X` |
+| Subscribe `$service/X/apply/+` and `retract/+` | `$provide/service/X` |
+| Publish `$service/X` | `$consume/service/X` through a committed binding |
 | Publish internal service apply or retract topics | Plugin only |
-| Subscribe `$reg/X/#` as registry owner | Provide `$reg/X` |
-| Publish `$reg/X` | Require `$reg/X` with register access |
-| Subscribe `$reg/X/#` as observer | Require `$reg/X` with observe access |
+| Subscribe `$reg/X` | `$consume/reg/X` |
+| Subscribe `$reg/X/#` as registry owner | `$provide/reg/X` |
+| Publish `$reg/X` | `$consume/reg/X` through a committed binding |
+| Subscribe `$reg/X/#` as observer | `$consume/reg/X/#` |
 | Publish generated `$reg/X/...` entries | Plugin only |
 | Write reserved activation User Properties | Plugin only |
 
-The plugin checks authorization against the connected component, current activation, manifest, and committed provider binding.
+The plugin checks authorization against the connected component, current activation, declarations, and committed provider binding.
 
 ### Core invariants
 
@@ -506,7 +518,7 @@ The model depends on these invariants:
 
 1. At most one activation is current for an instance.
 2. Only a connected component's current activation may advertise resources or send new application requests.
-3. A component accesses only resources and modes declared in its manifest.
+3. A component accesses only resources and operations allowed by its first SUBSCRIBE packet.
 4. A declared provision is not selectable until it is installed and its provider is active.
 5. Every dependent activation binds to concrete provider activations.
 6. Withdrawal from the target view precedes destructive cleanup.
@@ -539,25 +551,27 @@ The strongest framework guarantee is:
 
 ### Example
 
-A lamp may declare:
+A lamp sends this first SUBSCRIBE packet:
 
 ```text
-PROVIDES $state/lamp/1/contract
-PROVIDES $service/lamp/1/control
-PROVIDES $reg/lamp/1/controllers
+SUBSCRIBE
+    $provide/state/lamp/1/contract
+    $provide/service/lamp/1/control
+    $provide/reg/lamp/1/controllers
 ```
 
-A switch may declare:
+A switch sends this first SUBSCRIBE packet:
 
 ```text
-REQUIRES $state/lamp/1/contract with read access
-REQUIRES $service/lamp/1/control
-REQUIRES $reg/lamp/1/controllers with register access
+SUBSCRIBE
+    $consume/state/lamp/1/contract
+    $consume/service/lamp/1/control
+    $consume/reg/lamp/1/controllers
 ```
 
 The lamp publishes its retained contract, receives control operations, and consumes activation-scoped controller records. The switch reads the contract, publishes opaque control operations, and maintains its plugin-generated controller entry.
 
-If the switch deactivates, the plugin retracts its control effects and deletes its registry entry. If the lamp begins a graceful shutdown, the plugin first prevents new switches from binding, then deactivates existing switches, waits for their retractions and registry removal, and finally permits the lamp to remove its subscriptions.
+If the switch deactivates, the plugin retracts its control effects and deletes its registry entry. If the lamp begins a graceful shutdown, the plugin first prevents new switches from binding, then deactivates existing switches, waits for their retractions and registry removal, and finally removes the lamp's subscriptions.
 
 The lamp defines the physical meaning of control and retraction. The plugin does not choose a default lamp state or simulate the lamp.
 
@@ -568,13 +582,13 @@ The lamp defines the physical meaning of control and retraction. The plugin does
 | Key | Logical `$state`, `$service`, or `$reg` resource contract |
 | Component | Customer MQTT component |
 | Fiber | One component activation |
-| Coeffect specification | Declared `requires` set and access modes |
+| Coeffect specification | Dependencies declared with `$consume/...` |
 | Provision | Declared and installed topic resource |
 | Coeffect operation | State access, service apply/retract, or registry registration |
 | Revertible effect | Managed operation paired with restore, delete, or retract |
 | Target view | Provider activations selectable now |
 | Committed view | Provider activations bound to one current activation |
-| Confinement | Manifest and activation-based topic authorization |
+| Confinement | Topic authorization based on declarations and current activation |
 | Recovery | Dependency-ordered cleanup and inverse execution |
 
 The paper's inverse and commutativity witnesses are runtime contract obligations here. The plugin enforces identities, access, bindings, and ordering. Resource authors define the application semantics that make their opaque operations retractable and commutative.
