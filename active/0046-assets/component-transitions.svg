@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="370" viewBox="0 0 1000 370" role="img" aria-labelledby="title description">
+  <title id="title">MQTT component transitions</title>
+  <desc id="description">Adapted from Figure 1 of A Programming Paradigm for Spatiotemporal Composability. O-Insert adds an Inactive component; O-Remove removes its record. L-Begin moves Inactive to Starting. L-Iter repeats within Starting. L-Finish moves Starting to Active. L-Divert moves Starting to Stopping. L-Leave moves Active to Stopping. L-Unload returns Stopping to Inactive. O-Retire sets the retiring flag in any lifecycle state and is omitted.</desc>
+  <rect width="1000" height="370" fill="#fff"/>
+
+  <g fill="none" stroke="#667085" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path id="o-insert" d="M102 208 H250"/>
+    <path id="o-remove" d="M250 224 H102"/>
+    <path id="l-begin" d="M340 180 V136 Q340 116 360 116 H520"/>
+    <path id="l-finish" d="M700 116 H860 Q880 116 880 136 V180"/>
+    <path id="l-iter" d="M575 80 C535 14 685 14 645 80"/>
+    <path id="l-divert" d="M610 152 V280"/>
+    <path id="l-leave" d="M880 252 V296 Q880 316 860 316 H700"/>
+    <path id="l-unload" d="M520 316 H360 Q340 316 340 296 V252"/>
+  </g>
+
+  <g fill="none" stroke="#667085" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M241 202 L250 208 L241 214"/>
+    <path d="M111 218 L102 224 L111 230"/>
+    <path d="M511 110 L520 116 L511 122"/>
+    <path d="M874 171 L880 180 L886 171"/>
+    <path d="M646 70 L645 80 L654 74"/>
+    <path d="M604 271 L610 280 L616 271"/>
+    <path d="M709 310 L700 316 L709 322"/>
+    <path d="M334 261 L340 252 L346 261"/>
+  </g>
+
+  <g fill="#f2f4f7" stroke="#667085" stroke-width="2">
+    <circle id="absent" cx="80" cy="216" r="14"/>
+    <rect id="inactive" x="260" y="190" width="160" height="52" rx="14"/>
+    <rect id="starting" x="530" y="90" width="160" height="52" rx="14"/>
+    <rect id="active" x="800" y="190" width="160" height="52" rx="14"/>
+    <rect id="stopping" x="530" y="290" width="160" height="52" rx="14"/>
+  </g>
+
+  <g fill="#101828" font-family="Arial, Helvetica, sans-serif" font-size="22" text-anchor="middle">
+    <text x="340" y="224">Inactive</text>
+    <text x="610" y="124">Starting</text>
+    <text x="880" y="224">Active</text>
+    <text x="610" y="324">Stopping</text>
+  </g>
+
+  <g fill="#344054" font-family="Arial, Helvetica, sans-serif" font-size="18" text-anchor="middle">
+    <text x="176" y="194">O-Insert</text>
+    <text x="176" y="249">O-Remove</text>
+    <text x="434" y="100">L-Begin</text>
+    <text x="789" y="100">L-Finish</text>
+    <text x="610" y="21">L-Iter</text>
+    <text x="627" y="221" text-anchor="start">L-Divert</text>
+    <text x="789" y="300">L-Leave</text>
+    <text x="434" y="300">L-Unload</text>
+  </g>
+</svg>
